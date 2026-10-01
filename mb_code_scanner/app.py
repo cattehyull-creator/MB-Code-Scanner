@@ -170,6 +170,70 @@ def extract_codes(text: str):
     return result
 
 
+
+def clean_batch_candidate(value: str) -> str:
+    """Clean a batch-number candidate while keeping useful separators."""
+    value = value.upper().strip()
+    value = value.replace("O", "0") if value.isdigit() else value
+    value = re.sub(r"[^A-Z0-9./ -]", " ", value)
+    value = re.sub(r"\s+", " ", value).strip(" -:;,.\t")
+    return value
+
+
+def extract_batch(text: str):
+    """Extract a batch number from OCR text near the 'NO. BATCH' label.
+
+    Batch formats can vary, so this intentionally does not force a fixed
+    pattern. It prefers the text on the same OCR line as NO. BATCH and then
+    falls back to the following short line.
+    """
+    raw = text.upper()
+    raw = raw.replace("№", "NO")
+    raw = raw.replace("N0", "NO")
+    raw = raw.replace("BATCH.", "BATCH")
+    raw = raw.replace("BATCH:", "BATCH ")
+
+    lines = [re.sub(r"\s+", " ", x).strip() for x in raw.splitlines()]
+    lines = [x for x in lines if x]
+
+    # Most useful case: "NO. BATCH 26 188 95" on one OCR line.
+    for i, line in enumerate(lines):
+        compact = re.sub(r"[^A-Z0-9.]", "", line)
+        if "BATCH" in compact:
+            m = re.search(r"BATCH\s*[:.\-]?\s*(.+)$", line, re.I)
+            if m:
+                candidate = clean_batch_candidate(m.group(1))
+                # Remove common following field labels if OCR put them on
+                # the same line.
+                candidate = re.split(
+                    r"\s+(?:EXP|EXPDATE|EXP\.DATE|CONTROLLED|CONTENTS|QTY|QTY/PER|DESCRIPTION|ITEM|LINE|SHIFT|PACKING|PACKER|QACC)\b",
+                    candidate,
+                    maxsplit=1,
+                )[0].strip(" -:;,." )
+                if 2 <= len(candidate) <= 40 and re.search(r"\d", candidate):
+                    return candidate
+
+            # If the label is isolated, use the next short OCR line.
+            if i + 1 < len(lines):
+                candidate = clean_batch_candidate(lines[i + 1])
+                if 2 <= len(candidate) <= 30 and re.search(r"\d", candidate):
+                    return candidate
+
+    # More tolerant fallback for OCR that merges NO/BATCH.
+    flat = re.sub(r"\s+", " ", raw)
+    m = re.search(r"(?:NO\s*\.?\s*)?BATCH\s*[:\-]?\s*([A-Z0-9][A-Z0-9./ -]{1,39})", flat)
+    if m:
+        candidate = clean_batch_candidate(m.group(1))
+        candidate = re.split(
+            r"\s+(?:EXP|EXPDATE|EXP\.DATE|CONTROLLED|CONTENTS|QTY|DESCRIPTION|ITEM|LINE|SHIFT|PACKING|PACKER|QACC)\b",
+            candidate,
+            maxsplit=1,
+        )[0].strip(" -:;,." )
+        if 2 <= len(candidate) <= 40 and re.search(r"\d", candidate):
+            return candidate
+
+    return ""
+
 def rotate_bound(image, angle):
     h, w = image.shape[:2]
     center = (w / 2, h / 2)
@@ -271,11 +335,12 @@ def process_image(path, tesseract_cmd):
 
     texts = []
     all_codes = []
+    batch = ""
 
     variants = make_variants(image)
 
-    # Try several page segmentation modes because the label can be a small
-    # isolated text area or be surrounded by cardboard/background text.
+    # Do not stop when only the MB code is found. Batch number is often much
+    # smaller and lives on a different label, so we need additional OCR passes.
     for variant in variants:
         for psm in (11, 6, 12, 7):
             text = _ocr(variant, psm)
@@ -286,11 +351,13 @@ def process_image(path, tesseract_cmd):
                 if code not in all_codes:
                     all_codes.append(code)
 
-            # A valid code is enough to stop expensive extra OCR passes.
-            if all_codes:
-                return all_codes, "\n".join(texts)
+            if not batch:
+                batch = extract_batch(text)
 
-    return all_codes, "\n".join(texts)
+            if all_codes and batch:
+                return all_codes, batch, "\n".join(texts)
+
+    return all_codes, batch, "\n".join(texts)
 
 
 class App(TkinterDnD.Tk):
@@ -335,7 +402,7 @@ class App(TkinterDnD.Tk):
         ttk.Label(root, text=APP_NAME, style="Title.TLabel").pack(anchor="w")
         ttk.Label(
             root,
-            text="OCR offline untuk membaca kode MB dari banyak foto",
+            text="OCR offline untuk membaca Kode MB + No. Batch dari banyak foto",
             style="Sub.TLabel",
         ).pack(anchor="w", pady=(2, 16))
 
@@ -425,13 +492,15 @@ class App(TkinterDnD.Tk):
             font=("Segoe UI", 11, "bold"),
         ).pack(anchor="w", pady=(0, 6))
 
-        cols = ("file", "codes", "status")
+        cols = ("file", "codes", "batch", "status")
         self.tree = ttk.Treeview(right, columns=cols, show="headings")
         self.tree.heading("file", text="Foto")
         self.tree.heading("codes", text="Kode valid")
+        self.tree.heading("batch", text="No. Batch")
         self.tree.heading("status", text="Status")
         self.tree.column("file", width=260)
         self.tree.column("codes", width=300)
+        self.tree.column("batch", width=180)
         self.tree.column("status", width=150)
         self.tree.pack(fill="both", expand=True)
 
@@ -555,13 +624,13 @@ class App(TkinterDnD.Tk):
                 path = future_map[future]
 
                 try:
-                    codes, raw = future.result()
+                    codes, batch, raw = future.result()
                     error = ""
                 except Exception as e:
-                    codes, raw, error = [], "", str(e)
+                    codes, batch, raw, error = [], "", "", str(e)
 
                 self.queue.put(
-                    ("result", path, codes, error)
+                    ("result", path, codes, batch, error)
                 )
 
                 done += 1
@@ -575,7 +644,7 @@ class App(TkinterDnD.Tk):
                 msg = self.queue.get_nowait()
 
                 if msg[0] == "result":
-                    _, path, codes, error = msg
+                    _, path, codes, batch, error = msg
                     status = (
                         "ERROR"
                         if error
@@ -586,6 +655,7 @@ class App(TkinterDnD.Tk):
                         {
                             "file": path,
                             "codes": codes,
+                            "batch": batch,
                             "status": status,
                             "error": error,
                         }
@@ -597,6 +667,7 @@ class App(TkinterDnD.Tk):
                         values=(
                             Path(path).name,
                             ", ".join(codes) if codes else "—",
+                            batch if batch else "—",
                             status,
                         ),
                     )
@@ -617,8 +688,8 @@ class App(TkinterDnD.Tk):
                     )
 
                     self.status_var.set(
-                        f"Selesai. {count} kode valid ditemukan "
-                        f"dari {len(self.files)} foto."
+                        f"Selesai. {count} kode MB ditemukan dari {len(self.files)} foto. "
+                        f"No. Batch ikut dibaca bila terdeteksi."
                     )
 
         except queue.Empty:
@@ -652,7 +723,7 @@ class App(TkinterDnD.Tk):
         ) as f:
             writer = csv.writer(f)
             writer.writerow(
-                ["Foto", "Kode Valid", "Status"]
+                ["Foto", "Kode Valid", "No. Batch", "Status"]
             )
 
             for r in self.results:
@@ -662,6 +733,7 @@ class App(TkinterDnD.Tk):
                             [
                                 Path(r["file"]).name,
                                 code,
+                                r.get("batch", ""),
                                 r["status"],
                             ]
                         )
@@ -670,6 +742,7 @@ class App(TkinterDnD.Tk):
                         [
                             Path(r["file"]).name,
                             "",
+                            r.get("batch", ""),
                             r["status"],
                         ]
                     )
