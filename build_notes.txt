@@ -1,0 +1,5 @@
+MB Code Scanner - build note
+
+The project intentionally uses Tesseract as a bundled local OCR engine.
+A Windows build machine is required to produce a native Windows EXE with PyInstaller.
+The provided build_windows.bat expects a local ./tesseract folder containing tesseract.exe, tessdata, and its DLLs.

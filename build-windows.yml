@@ -1,0 +1,50 @@
+name: Build MB Code Scanner (Windows EXE)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: 'x64'
+          cache: 'pip'
+
+      - name: Install Python dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Install Tesseract OCR
+        shell: powershell
+        run: |
+          choco install tesseract -y --no-progress
+          $src = 'C:\Program Files\Tesseract-OCR'
+          if (!(Test-Path "$src\tesseract.exe")) {
+            throw "Tesseract executable was not found at $src"
+          }
+          New-Item -ItemType Directory -Force -Path 'tesseract' | Out-Null
+          Copy-Item "$src\*" 'tesseract' -Recurse -Force
+
+      - name: Build application
+        shell: cmd
+        run: |
+          python -m PyInstaller --noconfirm --clean --windowed --name "MB Code Scanner" --collect-all tkinterdnd2 --add-data "tesseract;tesseract" mb_code_scanner\app.py
+
+      - name: Create portable ZIP
+        shell: powershell
+        run: |
+          Compress-Archive -Path 'dist\MB Code Scanner\*' -DestinationPath 'MB-Code-Scanner-Windows.zip' -Force
+
+      - name: Upload EXE package
+        uses: actions/upload-artifact@v4
+        with:
+          name: MB-Code-Scanner-Windows
+          path: MB-Code-Scanner-Windows.zip
+          if-no-files-found: error

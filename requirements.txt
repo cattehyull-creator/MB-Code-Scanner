@@ -1,0 +1,6 @@
+opencv-python>=4.10,<5
+numpy>=2.0,<3
+Pillow>=10,<12
+pytesseract>=0.3.13,<0.4
+tkinterdnd2>=0.4.3,<0.5
+pyinstaller>=6.10,<7
